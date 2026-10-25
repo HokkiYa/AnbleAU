@@ -1,7 +1,7 @@
 // ============================================================================
 //  eye_face.ino  -  Mini-OS cho ESP32 + ST7789V 2.8" cam ung (man NGANG)
 //  Giao dien Frutiger Aero: nen troi gradient, bong bong, nut kinh bong.
-//  Menu vuot trang + cac app: Mat AI (gop het), Matrix, Do sang, Thong tin, Ngu
+//  Menu vuot trang + cac app: Mat AI (gop het), Chat AI, Matrix, Do sang, Thong tin, Ngu
 //
 //  Thu vien: LovyanGFX (lovyan03).  Cac file cung thu muc "eye_face":
 //      eye_face.ino  eye_engine.h  eye_bin.h  mieng_bin.h   (eye_engine.h GIU NGUYEN)
@@ -10,10 +10,41 @@
 //             goc duoi-phai = nut nha (thoat ve menu)
 //             Trong app Mat AI: goc duoi-trai = nut cai dat (cam xuc, noi, toc do)
 //             Trong Matrix: giu 3 giay o bat ky dau de thoat
+//             Trong Chat AI: cham thanh duoi = go phim | vuot doc = xem tin cu | nut do = xoa chat
+//  Chat AI can them thu vien ArduinoJson (v7) - cai trong Library Manager.
 // ============================================================================
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <esp_heap_caps.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <vector>
+
+// (dat o day de Arduino IDE thay kieu Msg truoc khi tu tao khai bao ham)
+struct Msg { bool me = false, err = false; String t, wr; uint16_t w = 0; uint8_t lines = 1; };
+
+// ============================ CAU HINH CHAT AI ==============================
+// API kieu OpenAI (/v1/chat/completions). Doi link/model/key la dung nha cung cap khac:
+//   OpenAI     https://api.openai.com/v1/chat/completions
+//   Groq       https://api.groq.com/openai/v1/chat/completions
+//   OpenRouter https://openrouter.ai/api/v1/chat/completions
+//   Gemini     https://generativelanguage.googleapis.com/v1beta/openai/chat/completions
+//   Ollama/LM Studio trong mang nha:  http://192.168.1.50:11434/v1/chat/completions (API_KEY de "")
+
+static const char* WIFI_SSID = "Nhap ten wifi o day";
+static const char* WIFI_PASS = "Nhap mat khau o day";
+static const char* API_URL   = " nhap link theo AI";
+static const char* API_KEY   = "Nhap key o day";
+static const char* API_MODEL = "Nhap ma phien ban AI o day";
+#define WIFI_OFF_ON_EXIT 1
+static const char* SYS_PROMPT = 
+  "Ban la Anble AI, tro ly ao hien thi tren man hinh nho cua ESP32, "
+  "Tra loi bang tieng Viet khong dau hoac co dau ngan gon, toi da duoi 25 tu, "
+  "tinh cach cute dang yeu phu hop voi frutiger aego, "
+  "Khong dung markdown, khong emoji, khong giai thich dong dai. ";
 
 #define EYE_BG           0xFFF0
 #define EYE_KEY          0xFFFF
@@ -224,7 +255,7 @@ static void pollTouch(uint32_t now) {
 }
 
 // ================================ APP ======================================
-enum App : uint8_t { A_MENU, A_EYE, A_MATRIX, A_BRIGHT, A_INFO, A_SLEEP };
+enum App : uint8_t { A_MENU, A_EYE, A_CHAT, A_MATRIX, A_BRIGHT, A_INFO, A_SLEEP };
 static App app = A_MENU;
 static int  brightness = 255;
 static bool inHome(int x, int y) { return x >= lcd.width() - 56 && y >= lcd.height() - 44; }
@@ -243,12 +274,14 @@ static void infoDraw();
 static bool eyeEnter();
 static void eyeExit();
 static void matrixEnter();
+static void chatEnter();
 
 static void gotoApp(uint8_t a) {
   swallow = tp.down;
   app = (App)a;
   switch (a) {
     case A_MENU:   lcd.setBrightness(brightness); menuDraw(); break;
+    case A_CHAT:   chatEnter(); break;
     case A_MATRIX: matrixEnter(); break;
     case A_BRIGHT: brightDraw(); break;
     case A_INFO:   infoDraw(); break;
@@ -261,6 +294,7 @@ static void gotoApp(uint8_t a) {
 struct Item { const char* name; App app; uint16_t top, bot; };
 static const Item kItems[] = {
   { "Mat AI",    A_EYE,    RGB565( 90,180,255), RGB565( 10, 90,200) },
+  { "Chat AI",   A_CHAT,   RGB565(255,160,205), RGB565(190, 40,130) },
   { "Matrix",    A_MATRIX, RGB565(120,230,120), RGB565( 10,140, 45) },
   { "Do sang",   A_BRIGHT, RGB565(255,225,100), RGB565(240,140,  0) },
   { "Thong tin", A_INFO,   RGB565(200,160,255), RGB565(100, 60,200) },
@@ -279,32 +313,37 @@ static void cellRect(int slot, int& x, int& y, int& w, int& h) {
 
 static void drawIcon(int id, int cx, int cy, uint16_t bot) {
   switch (id) {
-    case 0:  // mat
+    case A_CHAT:    // bong chat
+      lcd.fillRoundRect(cx - 24, cy - 17, 48, 30, 10, C_TEXT);
+      lcd.fillTriangle(cx - 14, cy + 9, cx - 3, cy + 9, cx - 15, cy + 20, C_TEXT);
+      for (int k = -1; k <= 1; k++) lcd.fillCircle(cx + k * 12, cy - 2, 3, bot);
+      break;
+    case A_EYE:     // mat
       for (int s = -1; s <= 1; s += 2) {
         lcd.fillCircle(cx + s * 17, cy, 14, C_TEXT);
         lcd.fillCircle(cx + s * 17 + 2, cy + 1, 7, 0x0000);
         lcd.fillCircle(cx + s * 17 + 4, cy - 2, 2, C_TEXT);
       }
       break;
-    case 1:  // matrix: cac cot chu roi
+    case A_MATRIX:  // matrix: cac cot chu roi
       for (int c = 0; c < 5; c++)
         for (int r = 0; r < 4; r++)
           lcd.fillRect(cx - 26 + c * 11, cy - 20 + r * 10 + (c & 1) * 6, 7, 7,
                        r == 3 ? C_TEXT : mix(RGB565(0, 70, 20), RGB565(160, 255, 160), r * 80));
       break;
-    case 2:  // mat troi
+    case A_BRIGHT:  // mat troi
       lcd.fillCircle(cx, cy, 10, C_TEXT);
       for (int a = 0; a < 8; a++) {
         float r = a * 0.7854f;
         lcd.drawLine(cx + cosf(r) * 15, cy + sinf(r) * 15, cx + cosf(r) * 22, cy + sinf(r) * 22, C_TEXT);
       }
       break;
-    case 3:  // info
+    case A_INFO:    // info
       lcd.fillCircle(cx, cy, 20, C_TEXT);
       lcd.setFont(&fonts::Font4); lcd.setTextDatum(lgfx::middle_center);
       lcd.setTextColor(bot); lcd.drawString("i", cx, cy + 1);
       break;
-    case 4:  // ngu: Zzz
+    case A_SLEEP:   // ngu: Zzz
       lcd.setFont(&fonts::Font4); lcd.setTextDatum(lgfx::middle_center);
       lcd.setTextColor(RGB565(15, 60, 120)); lcd.drawString("Zzz", cx + 1, cy + 1);
       lcd.setTextColor(C_TEXT);              lcd.drawString("Zzz", cx, cy);
@@ -320,7 +359,7 @@ static void menuDraw() {
     if (i >= N_ITEMS) break;
     int x, y, w, h; cellRect(s, x, y, w, h);
     glossyTile(x, y, w, h, 16, kItems[i].top, kItems[i].bot);
-    drawIcon(i, x + w / 2, y + 34, kItems[i].bot);
+    drawIcon(kItems[i].app, x + w / 2, y + 34, kItems[i].bot);
     label(kItems[i].name, x + w / 2, y + h - 14);
   }
   for (int p = 0; p < N_PAGES; p++) {
@@ -357,12 +396,17 @@ static void menuLoop() {
 static const int SL_X0 = 30, SL_X1 = 290, SL_Y = 110;
 static void brightBar() {
   int fx = SL_X0 + (brightness - 10) * (SL_X1 - SL_X0) / 245;
+  lcd.startWrite();
+  lcd.setClipRect(SL_X0 - 16, SL_Y - 8, SL_X1 - SL_X0 + 32, 32);   // vung thanh truot + nut
+  skyBg();                                                          // ve lai nen -> xoa vet nut cu
+  lcd.clearClipRect();
   lcd.fillRoundRect(SL_X0, SL_Y, SL_X1 - SL_X0, 16, 8, RGB565(215, 238, 252));
   lcd.drawRoundRect(SL_X0, SL_Y, SL_X1 - SL_X0, 16, 8, RGB565(90, 160, 220));
   lcd.fillRoundRect(SL_X0 + 2, SL_Y + 2, fx - SL_X0, 12, 6, mix(RGB565(255, 225, 100), RGB565(240, 140, 0), 128));
   lcd.fillCircle(fx, SL_Y + 8, 13, C_TEXT);
   lcd.drawCircle(fx, SL_Y + 8, 13, RGB565(90, 160, 220));
   lcd.fillCircle(fx - 3, SL_Y + 4, 4, RGB565(225, 245, 255));
+  lcd.endWrite();
 }
 static void brightDraw() {
   skyBg();
@@ -682,6 +726,266 @@ static void eyeLoop() {
   }
 }
 
+// ============================== APP CHAT AI =================================
+static std::vector<Msg> msgs;
+static String kbText;
+static bool   kbOpen = false;
+static int    chatScroll = 0;                       // px da cuon len (0 = tin moi nhat)
+static const int CH_T = 34, CH_B = 196, CH_PAD = 7, CH_LH = 17, CH_GAP = 6, CH_MAXW = 220;
+static const int CH_MAX = 12, CH_HIST = 8, KB_MAX = 200, KB_Y = 38;
+static const char* const kRows[4] = { "1234567890", "qwertyuiop", "asdfghjkl,", "zxcvbnm.?!" };
+
+// Font co san khong co dau tieng Viet -> doi ky tu UTF-8 sang ASCII (bo dau)
+static char fold(uint32_t u) {
+  static const char L1[] = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYTsaaaaaaaceeeeiiiidnooooo/ouuuuyty";   // U+00C0..00FF
+  static const char VN[] = "AaAaAaAaAaAaAaAaAaAaAaAaEeEeEeEeEeEeEeEeIiIiOoOoOoOoOoOoOoOoOoOoOoOoUuUuUuUuUuUuUuYyYyYyYy";  // U+1EA0..1EF9
+  static const uint16_t SP[] = { 0x102, 0x103, 0x110, 0x111, 0x128, 0x129, 0x168, 0x169, 0x1A0, 0x1A1, 0x1AF, 0x1B0,
+                                 0x2018, 0x2019, 0x201C, 0x201D, 0x2013, 0x2014, 0x2022 };
+  static const char SPC[] = "AaDdIiUuOoUu''\"\"--*";
+  static_assert(sizeof(L1) == 65 && sizeof(VN) == 91 && sizeof(SPC) == sizeof(SP) / 2 + 1, "bang ky tu sai do dai");
+  if (u < 0x80) return (char)u;
+  if (u >= 0xC0 && u <= 0xFF) return L1[u - 0xC0];
+  if (u >= 0x1EA0 && u <= 0x1EF9) return VN[u - 0x1EA0];
+  for (unsigned i = 0; i < sizeof(SP) / 2; i++) if (SP[i] == u) return SPC[i];
+  return 0;                                          // emoji, dau roi... -> bo
+}
+static String ascii(const char* s) {
+  String o;
+  while (*s) {
+    uint32_t u = (uint8_t)*s++;
+    if (u >= 0xC0) {
+      int n = u >= 0xF0 ? 3 : (u >= 0xE0 ? 2 : 1);
+      u &= 0x3F >> n;
+      while (n-- && (*s & 0xC0) == 0x80) u = (u << 6) | (*s++ & 0x3F);
+    } else if (u >= 0x80) continue;
+    if (char c = fold(u)) o += c;
+  }
+  return o;
+}
+
+// ngat dong theo CH_MAXW, tinh kich thuoc bong bong
+static void layout(Msg& m) {
+  lcd.setFont(&fonts::Font2);
+  String line;
+  m.wr = ""; m.w = 0; m.lines = 0;
+  auto flush = [&]() {
+    if (m.lines++) m.wr += '\n';
+    m.wr += line;
+    int tw = lcd.textWidth(line.c_str());
+    if (tw > m.w) m.w = tw;
+    line = "";
+  };
+  for (unsigned i = 0; i < m.t.length(); i++) {
+    char c = m.t[i];
+    if (c == '\n') { flush(); continue; }
+    line += c;
+    if (lcd.textWidth(line.c_str()) <= CH_MAXW) continue;
+    int sp = line.lastIndexOf(' ');
+    int cut = sp > 0 ? sp : (int)line.length() - 1;
+    String rest = line.substring(sp > 0 ? sp + 1 : cut);
+    line.remove(cut);
+    flush();
+    line = rest;
+  }
+  if (line.length() || !m.lines) flush();
+}
+
+static int msgH(const Msg& m) { return m.lines * CH_LH + 2 * CH_PAD; }
+static int chatTotal() { int s = 0; for (auto& m : msgs) s += msgH(m) + CH_GAP; return s; }
+
+static void addMsg(bool me, const String& t, bool err = false) {
+  Msg m; m.me = me; m.err = err; m.t = t;
+  layout(m);
+  msgs.push_back(m);
+  if ((int)msgs.size() > CH_MAX) msgs.erase(msgs.begin());
+}
+
+static void chatDraw() {
+  const int W = lcd.width();
+  skyBg();
+  titlePill("CHAT AI");
+  if (msgs.empty()) label("Cham thanh ben duoi de chat voi AI", W / 2, 115);
+  lcd.setClipRect(0, CH_T, W, CH_B - CH_T);
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(lgfx::top_left);
+  int y = CH_B + chatScroll;
+  for (int i = (int)msgs.size() - 1; i >= 0; i--) {
+    const Msg& m = msgs[i];
+    int bh = msgH(m), bw = m.w + 2 * CH_PAD;
+    y -= bh + CH_GAP;
+    if (y >= CH_B) continue;
+    if (y + bh <= CH_T) break;
+    int x = m.me ? W - 8 - bw : 8;
+    lcd.fillRoundRect(x, y, bw, bh, 12, m.me ? RGB565(0, 132, 255) : (m.err ? RGB565(255, 215, 215) : RGB565(236, 240, 245)));
+    lcd.setTextColor(m.me ? C_TEXT : (m.err ? RGB565(150, 20, 20) : RGB565(20, 30, 45)));
+    int ty = y + CH_PAD;
+    for (int p = 0; p < (int)m.wr.length(); ) {
+      int e = m.wr.indexOf('\n', p);
+      if (e < 0) e = m.wr.length();
+      lcd.drawString(m.wr.substring(p, e).c_str(), x + CH_PAD, ty);
+      ty += CH_LH; p = e + 1;
+    }
+  }
+  lcd.clearClipRect();
+  // thanh duoi: [xoa chat] [o nhap] [nha]
+  int h = lcd.height();
+  glossyTile(11, h - 39, 34, 34, 17, RGB565(255, 150, 140), RGB565(200, 40, 40));
+  label("Xoa", 28, h - 22);
+  lcd.fillRoundRect(58, 200, 200, 34, 17, C_TEXT);
+  lcd.drawRoundRect(58, 200, 200, 34, 17, RGB565(90, 160, 220));
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextDatum(lgfx::middle_left);
+  lcd.setTextColor(RGB565(130, 150, 170));
+  lcd.drawString("Nhap tin nhan...", 74, 217);
+  drawHome();
+}
+
+// goi API; tra ve true neu co noi dung. out = cau tra loi hoac thong bao loi
+static bool chatAsk(String& out) {
+  if (WiFi.status() != WL_CONNECTED) {
+    for (uint32_t t = millis(); WiFi.status() != WL_CONNECTED && millis() - t < 25000; ) delay(100);   // cho toi da 25 s
+    if (WiFi.status() != WL_CONNECTED) {
+      out = "WiFi loi, ma " + String((int)WiFi.status()) + " (1=khong thay ten WiFi, 4=sai mat khau)";
+      return false;
+    }
+  }
+  JsonDocument req;
+  req["model"] = API_MODEL;
+  JsonArray arr = req["messages"].to<JsonArray>();
+  JsonObject sys = arr.add<JsonObject>();
+  sys["role"] = "system"; sys["content"] = SYS_PROMPT;
+  size_t last = msgs.size() - 1;                      // tin cuoi = bong "..." dang cho
+  for (size_t i = last > CH_HIST ? last - CH_HIST : 0; i < last; i++) {
+    if (msgs[i].err) continue;
+    JsonObject o = arr.add<JsonObject>();
+    o["role"] = msgs[i].me ? "user" : "assistant";
+    o["content"] = msgs[i].t;
+  }
+  String body;
+  serializeJson(req, body);
+
+  static WiFiClientSecure tls;
+  static WiFiClient plain;
+  tls.setInsecure();                                  // khong kiem chung chi (doi: tls.setCACert(...))
+  HTTPClient http;
+  http.useHTTP10(true);                               // tranh chunked -> doc stream thang vao JSON
+  http.setTimeout(20000);
+  if (!http.begin(strncmp(API_URL, "https", 5) == 0 ? (WiFiClient&)tls : plain, API_URL)) { out = "Link API sai"; return false; }
+  http.addHeader("Content-Type", "application/json");
+  if (*API_KEY) http.addHeader("Authorization", String("Bearer ") + API_KEY);
+
+  bool ok = false;
+  int code = http.POST(body);
+  if (code <= 0) out = "Loi mang: " + http.errorToString(code);
+  else {
+    JsonDocument filter, res;
+    filter["choices"][0]["message"]["content"] = true;
+    filter["error"]["message"] = true;
+    if (deserializeJson(res, http.getStream(), DeserializationOption::Filter(filter))) out = "Loi doc phan hoi (" + String(code) + ")";
+    else if (code != 200) out = "Loi " + String(code) + ": " + String(res["error"]["message"] | "");
+    else {
+      out = res["choices"][0]["message"]["content"] | "";
+      ok = out.length() > 0;
+      if (!ok) out = "Phan hoi rong";
+    }
+  }
+  http.end();
+  return ok;
+}
+
+static void chatSend() {
+  addMsg(true, kbText);
+  addMsg(false, "...");
+  kbText = ""; kbOpen = false; chatScroll = 0; swallow = tp.down;
+  chatDraw();
+  String r;
+  bool ok = chatAsk(r);
+  Msg& p = msgs.back();
+  p.t = ascii(r.c_str()); p.err = !ok;
+  layout(p);
+  chatDraw();
+}
+
+// ---- ban phim tren man hinh ----
+static void kbBox() {
+  lcd.fillRoundRect(6, 4, 308, 30, 10, C_TEXT);
+  lcd.drawRoundRect(6, 4, 308, 30, 10, RGB565(90, 160, 220));
+  String s = kbText + "_";
+  lcd.setFont(&fonts::Font2);
+  lcd.setTextColor(C_DARK);
+  bool ov = lcd.textWidth(s.c_str()) > 292;                   // qua dai -> can phai, phan thua ben trai bi cat
+  lcd.setClipRect(12, 4, 296, 30);
+  lcd.setTextDatum(ov ? lgfx::middle_right : lgfx::middle_left);
+  lcd.drawString(s.c_str(), ov ? 308 : 12, 19);
+  lcd.clearClipRect();
+}
+static void kbKey(int x, int y, int w, const char* s, uint16_t top, uint16_t bot) {
+  glossyTile(x, y, w - 3, 30, 9, top, bot);
+  label(s, x + (w - 3) / 2, y + 15);
+}
+static void kbDraw() {
+  skyBg();
+  kbBox();
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 10; c++) {
+      char s[2] = { kRows[r][c], 0 };
+      kbKey(c * 32, KB_Y + r * 34, 32, s, RGB565(150, 210, 255), RGB565(40, 120, 220));
+    }
+  const int y = KB_Y + 4 * 34;
+  kbKey(0,   y, 64,  "Huy",  RGB565(255, 150, 140), RGB565(200, 40, 40));
+  kbKey(64,  y, 64,  "Xoa",  RGB565(255, 225, 100), RGB565(240, 140, 0));
+  kbKey(128, y, 128, "Cach", RGB565(190, 225, 255), RGB565(90, 150, 215));
+  kbKey(256, y, 64,  "Gui",  RGB565(130, 235, 140), RGB565(20, 150, 60));
+}
+static void kbLoop() {
+  if (!tp.pressEdge || tp.sy < KB_Y) return;
+  int r = (tp.sy - KB_Y) / 34;
+  if (r > 4) return;
+  if (r < 4) {
+    if (kbText.length() < KB_MAX) kbText += kRows[r][min(tp.sx / 32, 9)];
+  } else {
+    int k = tp.sx / 64;
+    if (k == 0) { kbOpen = false; swallow = tp.down; chatDraw(); return; }
+    if (k == 4) { if (kbText.length()) chatSend(); return; }
+    if (k == 1) { if (kbText.length()) kbText.remove(kbText.length() - 1); }
+    else if (kbText.length() < KB_MAX) kbText += ' ';
+  }
+  kbBox();
+}
+
+static void chatEnter() {
+  if (WiFi.status() != WL_CONNECTED) {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    delay(150);                                       // cho driver khoi dong xong roi moi dat MAC
+    esp_wifi_set_mac(WIFI_IF_STA, WIFI_MAC);
+    WiFi.setSleep(false);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+  kbOpen = false; chatScroll = 0;
+  chatDraw();
+}
+
+static void chatLoop() {
+  if (kbOpen) { kbLoop(); return; }
+  if (tp.pressEdge && inHome(tp.sx, tp.sy)) {
+    if (WIFI_OFF_ON_EXIT) { WiFi.disconnect(true); delay(150); WiFi.mode(WIFI_OFF); delay(150); }   // ngat tu tu roi moi tat
+    gotoApp(A_MENU); return;
+  }
+  if (!tp.releaseEdge) return;
+  if (swallow) { swallow = false; return; }
+  int dx = tp.x - tp.sx, dy = tp.y - tp.sy;
+  if (abs(dy) > 30 && abs(dy) > abs(dx)) {            // vuot doc = cuon tin nhan
+    int mx = max(0, chatTotal() - (CH_B - CH_T));
+    chatScroll = constrain(chatScroll + (dy > 0 ? 90 : -90), 0, mx);
+    chatDraw();
+    return;
+  }
+  if (abs(dx) > 18 || abs(dy) > 18 || tp.sy < CH_B) return;
+  if (inGear(tp.sx, tp.sy))                      { msgs.clear(); chatScroll = 0; chatDraw(); }
+  else if (tp.sx >= 58 && tp.sx < 258)           { kbOpen = true; kbDraw(); }
+}
+
 // ============================== SETUP / LOOP ================================
 void setup() {
   Serial.begin(115200);
@@ -696,6 +1000,7 @@ void loop() {
   switch (app) {
     case A_MENU:   menuLoop();   break;
     case A_EYE:    eyeLoop();    return;
+    case A_CHAT:   chatLoop();   break;
     case A_MATRIX: matrixLoop(); break;
     case A_BRIGHT: brightLoop(); break;
     case A_INFO:   infoLoop();   break;
