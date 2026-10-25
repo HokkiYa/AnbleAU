@@ -277,24 +277,25 @@ static EYE_OPT void mouthRender(const uint16_t* frame, bool be, uint16_t* out) {
 // ----------------------------------------------------------------------------
 //  Phan 2: "bo nao" - dieu khien anh mat, chop mat, bieu cam, mieng
 // ----------------------------------------------------------------------------
-#ifndef MOUTH_F_BC
-#define MOUTH_F_BC      0
-#endif
-#ifndef MOUTH_F_BIG
-#define MOUTH_F_BIG     1
-#endif
-#ifndef MOUTH_F_MID
-#define MOUTH_F_MID     2
-#endif
-#ifndef MOUTH_F_SMALL
-#define MOUTH_F_SMALL   3
-#endif
+// Khung mieng (trung voi mieng_bin.h; eye_face.ino co the #define de ghi de)
 #ifndef MOUTH_F_DEFAULT
-#define MOUTH_F_DEFAULT 4
+#define MOUTH_F_DEFAULT 0
 #endif
 #ifndef MOUTH_F_SAD
-#define MOUTH_F_SAD     5
+#define MOUTH_F_SAD     1
 #endif
+#ifndef MOUTH_F_HAPPY
+#define MOUTH_F_HAPPY   2
+#endif
+#ifndef MOUTH_F_BC
+#define MOUTH_F_BC      8
+#endif
+
+// Thu tu khung khi noi (chay het mang roi lap lai). Sua so o day de doi nhip mieng.
+//   noi luc buon ngu : 3-4-5-6 (di len roi quay xuong)
+//   noi luc khac     : 3-4-5-6-7 (di len roi quay xuong)
+static const uint8_t kTalkSleepy[] = { 3, 4, 5, 6, 5, 4 };
+static const uint8_t kTalkNormal[] = { 3, 4, 5, 6, 7, 6, 5, 4 };
 
 enum EyeMood : uint8_t { MOOD_NORMAL, MOOD_ANGRY, MOOD_SAD, MOOD_HAPPY, MOOD_SLEEPY, MOOD_COUNT };
 
@@ -318,6 +319,8 @@ struct EyeBrain {
   float mouthPeriod = 1.6f;
   float blinkClose = 0.11f, blinkHold = 0.05f, blinkOpen = 0.20f;
   bool  autoSpeak = true;
+  bool  winkEnabled = true;                // bat/tat nhay mat 1 ben
+  bool  winkLeftEye = true;                // true: nhay mat TRAI (gL), false: mat phai
 
   // --- trang thai ---
   float gx = 0, gy = 0, tx = 0, ty = 0;
@@ -330,6 +333,11 @@ struct EyeBrain {
   float saccadeT = 1.0f, microT = 0.3f, blinkT = 2.5f, blinkClock = 0.f, moodT = 12.f;
   bool blinking = false, doubleBlink = false;
   float moodHold = 0.f;
+  // nhay mat 1 ben (chi luc NORMAL / HAPPY)
+  // chi so 0 = mat TRAI (gL), 1 = mat PHAI (gR)
+  float winkT = 7.f, winkClock[2] = {0.f, 0.f}, winkDur[2] = {0.f, 0.f}, winkAmt[2] = {1.f, 1.f};
+  bool  winking[2] = {false, false};       // dang nhay (tu dong / winkNow)
+  bool  winkHold[2] = {false, false};      // dang bi giu nham (cham vao mat)
   // mieng
   float speakFor = 0.f, speakClock = 0.f, speakEnd = 0.f, speakIdle = 5.f;
   bool  speaking = false, speakForever = false;
@@ -339,18 +347,24 @@ struct EyeBrain {
   void setMood(EyeMood m) { mood = m; }
   void lookAt(float nx, float ny) { manualLook = true; tx = clampf(nx); ty = clampf(ny); }
   void releaseLook() { manualLook = false; saccadeT = 0.4f; }
+  void winkNow(int eye, float sec = 0.8f) { if (!winking[eye]) { winking[eye] = true; winkClock[eye] = 0.f; winkDur[eye] = sec; } }
+  static bool winkAllowed(EyeMood m) { return m == MOOD_NORMAL || m == MOOD_HAPPY; }
   void blinkNow() { if (!blinking) { blinking = true; blinkClock = 0.f; } }
   void speak(float seconds) { if (!speaking) { speaking = true; speakClock = 0.f; } speakFor = seconds; speakEnd = 0.f; }
   static float clampf(float v) { return v < -1.f ? -1.f : (v > 1.f ? 1.f : v); }
   static float smooth(float t) { t = t < 0 ? 0 : (t > 1 ? 1 : t); return t * t * (3.f - 2.f * t); }
 
   int mouthFrame() const {
-    if (mood == MOOD_SAD) return MOUTH_F_SAD;
-    if (!speaking) return MOUTH_F_DEFAULT;
-    float per = mouthPeriod < 0.2f ? 0.2f : mouthPeriod;
-    int step = (int)(fmodf(speakClock, per) / per * 4.f) %10;     // 3 -> 2 -> 1 -> 2
-    static const uint8_t seq[10] = { MOUTH_F_SMALL, MOUTH_F_MID, MOUTH_F_BIG, MOUTH_F_SMALL,MOUTH_F_BIG,MOUTH_F_SMALL,MOUTH_F_BIG,MOUTH_F_SMALL,MOUTH_F_BIG,MOUTH_F_SMALL };
-    return seq[step];
+    if (speaking) {                       // dang noi: uu tien khung noi, tru thoi theo mood
+      float per = mouthPeriod < 0.2f ? 0.2f : mouthPeriod;
+      const uint8_t* seq = (mood == MOOD_SLEEPY) ? kTalkSleepy : kTalkNormal;
+      int n = (mood == MOOD_SLEEPY) ? (int)sizeof(kTalkSleepy) : (int)sizeof(kTalkNormal);
+      int step = (int)(fmodf(speakClock, per) / per * n) % n;
+      return seq[step];
+    }
+    if (mood == MOOD_SAD)   return MOUTH_F_SAD;
+    if (mood == MOOD_HAPPY) return MOUTH_F_HAPPY;
+    return MOUTH_F_DEFAULT;               // normal / angry / sleepy luc im lang
   }
 
   void update(float dt) {
@@ -410,6 +424,21 @@ struct EyeBrain {
     cBrowDY   += (m.browDY   - cBrowDY)   * km;
     cBrowTilt += (m.browTilt - cBrowTilt) * km;
 
+    // --- nhay mat 1 ben (khong nhay luc buon / gian / buon ngu) ---
+    const int autoEye = winkLeftEye ? 0 : 1;
+    if (winkEnabled && winkAllowed(mood)) {
+      if (!winking[autoEye]) {
+        winkT -= dt;
+        if (winkT <= 0.f) { winkNow(autoEye, 0.5f + rnd() * 0.7f); winkT = 8.f + rnd() * 12.f; }
+      }
+    } else winking[autoEye] = false;         // doi sang mood khong cho nhay -> mo mat lai
+    for (int i = 0; i < 2; i++) {
+      if (winking[i]) { winkClock[i] += dt; if (winkClock[i] >= winkDur[i]) winking[i] = false; }
+      bool closed = winking[i] || winkHold[i];
+      winkAmt[i] += ((closed ? 0.f : 1.f) - winkAmt[i]) * (1.f - expf(-dt * 22.f));
+      if (winkAmt[i] > 0.995f) winkAmt[i] = 1.f;
+    }
+
     // --- mieng ---
     if (autoSpeak && !speaking && !speakForever && mood != MOOD_SAD) {
       speakIdle -= dt;
@@ -437,11 +466,12 @@ struct EyeBrain {
     r.pdx = (int16_t)lroundf(ox * gainPupil); r.pdy = (int16_t)lroundf(oy * gainPupil);
     r.gdx = (int16_t)lroundf(ox * gainGlint); r.gdy = (int16_t)lroundf(oy * gainGlint);
 
-    float open = lidMood * openAmt;
+    float myOpen = openAmt * winkAmt[dir > 0 ? 0 : 1];
+    float open = lidMood * myOpen;
     r.ldx = (int16_t)lroundf(ox * 0.20f);
     r.ldy = (int16_t)lroundf((1.f - open) * e.closeDY + vy * 2.f);
     r.bdx = (int16_t)lroundf(ox * 0.15f);
-    r.bdy = (int16_t)lroundf(cBrowDY - BC_LIFT + (1.f - openAmt) * 1.5f);
+    r.bdy = (int16_t)lroundf(cBrowDY - BC_LIFT + (1.f - myOpen) * 1.5f);
     //r.bdy = (int16_t)lroundf(cBrowDY + (1.f - openAmt) * 1.5f);
     r.bk  = (int16_t)lroundf(cBrowTilt * dir * 64.f);
   }
